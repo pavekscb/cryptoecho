@@ -1,0 +1,1081 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:ui' as ui; 
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+void main() {
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false, 
+      // ✅ ИМЯ ПРИЛОЖЕНИЯ
+      title: 'CryptoEcho', 
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: const Color(0xFF0E0E0E),
+        cardColor: const Color(0xFF1E1E1E),
+        canvasColor: const Color(0xFF0E0E0E), 
+        textTheme: const TextTheme(bodyMedium: TextStyle(color: Colors.white)),
+        appBarTheme: const AppBarTheme( 
+          backgroundColor: Color(0xFF121212),
+          titleTextStyle: TextStyle(color: Colors.white, fontSize: 20),
+          iconTheme: IconThemeData(color: Colors.white),
+        ),
+      ),
+      home: const PortfolioPage(),
+    );
+  }
+}
+
+class PortfolioPage extends StatefulWidget {
+  const PortfolioPage({super.key});
+  @override
+  State<PortfolioPage> createState() => _PortfolioPageState();
+}
+
+class _PortfolioPageState extends State<PortfolioPage> {
+  
+  List<String> _coins = ['BTCUSDT', 'ETHUSDT', 'APTUSDT'];
+  Map<String, double> _balances = {};
+  Map<String, double> _prices = {};
+  Map<String, double> _dayChange = {};
+  
+  Map<String, List<double>> _priceHistory = {}; 
+  Map<String, double> _intervalChange = {}; 
+  
+  double _portfolioValue = 0.0;
+  
+  int _refreshInterval = 10; 
+  int _seconds = 10;
+  Timer? _timer;
+  bool _isUpdating = false;
+  
+  bool _isDialogShowing = false;
+  
+  String? _selectedCoinForChart; 
+
+  final ValueNotifier<int> _chartUpdateNotifier = ValueNotifier(0); 
+
+  // Уведомления
+  bool _notificationsEnabled = true;
+  double _notificationThreshold = 0.01; 
+  int _notificationDuration = 10; 
+  
+  @override
+  void initState() {
+    super.initState();
+    _loadData().then((_) {
+      _seconds = _refreshInterval;
+      _fetchPrices();
+      if (_coins.isNotEmpty) {
+          _selectedCoinForChart = _coins.first;
+      }
+      _startTimer();
+    });
+  }
+
+  Future<void> _loadData() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _coins = prefs.getStringList('coins') ?? ['BTCUSDT', 'ETHUSDT', 'APTUSDT'];
+      _balances =
+          Map<String, double>.from(json.decode(prefs.getString('balances') ?? '{}'));
+      _refreshInterval = prefs.getInt('refreshInterval') ?? 10; 
+      
+      final historyJson = prefs.getString('priceHistory');
+      if (historyJson != null) {
+        final Map<String, dynamic> decoded = json.decode(historyJson);
+        _priceHistory = decoded.map((key, value) => MapEntry(key, List<double>.from(value)));
+      }
+      
+      _notificationsEnabled = prefs.getBool('notificationsEnabled') ?? true;
+      _notificationThreshold = prefs.getDouble('notificationThreshold') ?? 0.01;
+      _notificationDuration = prefs.getInt('notificationDuration') ?? 10; 
+    });
+  }
+
+  Future<void> _saveData() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('coins', _coins);
+    await prefs.setString('balances', json.encode(_balances));
+    await prefs.setInt('refreshInterval', _refreshInterval); 
+    
+    await prefs.setString('priceHistory', json.encode(_priceHistory)); 
+    
+    await prefs.setBool('notificationsEnabled', _notificationsEnabled);
+    await prefs.setDouble('notificationThreshold', _notificationThreshold);
+    await prefs.setInt('notificationDuration', _notificationDuration);
+  }
+
+  void _startTimer() {
+    _timer?.cancel(); 
+    
+    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (_seconds > 0) {
+        setState(() => _seconds--);
+      } else {
+        _fetchPrices();
+        setState(() => _seconds = _refreshInterval); 
+      }
+    });
+  }
+  
+  Future<void> _fetchPrices() async {
+    if (_isUpdating) return;
+    _isUpdating = true;
+
+    try {
+      for (var coin in _coins) {
+        final url = 'https://api.binance.com/api/v3/ticker/24hr?symbol=${coin.toUpperCase()}';
+        final response = await http.get(Uri.parse(url));
+
+        if (response.statusCode == 200) {
+          final data = json.decode(response.body);
+          final double newPrice = double.tryParse(data['lastPrice'] ?? '0') ?? 0.0;
+          final double oldPrice = _prices[coin] ?? 0.0; 
+
+          setState(() {
+            _prices[coin] = newPrice;
+            _dayChange[coin] =
+                double.tryParse(data['priceChangePercent'] ?? '0') ?? 0.0;
+
+            if (oldPrice > 0) {
+              _intervalChange[coin] = ((newPrice - oldPrice) / oldPrice) * 100;
+            } else {
+              _intervalChange[coin] = 0.0;
+            }
+
+            // История: сохраняем 11 последних цен (10 интервалов)
+            _priceHistory.putIfAbsent(coin, () => []);
+            _priceHistory[coin]!.insert(0, newPrice); 
+            if (_priceHistory[coin]!.length > 11) {
+              _priceHistory[coin]!.removeLast(); 
+            }
+          });
+        }
+      }
+      _calculatePortfolio();
+      _saveData(); 
+      
+      if (mounted) {
+          _chartUpdateNotifier.value++; 
+      }
+      
+    } catch (e) {
+      debugPrint('Ошибка загрузки цен: $e');
+    } finally {
+      _isUpdating = false;
+      
+      if (_notificationsEnabled) {
+          _checkPriceAlerts();
+      }
+    }
+  }
+
+  void _checkPriceAlerts() {
+    Map<String, double> triggeredAlerts = {};
+    for (var coin in _coins) {
+      final change = _intervalChange[coin] ?? 0.0;
+      
+      if (change.abs() >= _notificationThreshold) {
+        triggeredAlerts[coin] = change;
+      }
+    }
+    
+    if (triggeredAlerts.isNotEmpty) {
+        _showPriceAlertDialog(triggeredAlerts);
+    }
+  }
+
+  void _showPriceAlertDialog(Map<String, double> alerts) {
+    if (_isDialogShowing) {
+        return;
+    }
+    
+    int countdown = _notificationDuration;
+    Timer? dialogTimer; 
+    
+    _isDialogShowing = true; 
+    
+    showDialog(
+      context: context,
+      barrierDismissible: true, 
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setStateSB) {
+            
+            if (dialogTimer == null) {
+              dialogTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+                if (countdown > 1 && mounted) {
+                  setStateSB(() {
+                    countdown--;
+                  });
+                } else {
+                  timer.cancel();
+                  if (Navigator.of(context).canPop()) {
+                      Navigator.of(context).pop();
+                  }
+                }
+              });
+            }
+
+            return AlertDialog(
+              backgroundColor: const Color(0xFF1E1E1E),
+              title: const Text('🚨 Изменение цены!', 
+                  style: TextStyle(color: Colors.amber, fontWeight: FontWeight.bold)),
+              
+              content: SizedBox(
+                width: double.maxFinite,
+                child: ListView(
+                  shrinkWrap: true,
+                  children: alerts.entries.map((entry) {
+                    final coin = entry.key;
+                    final change = entry.value;
+                    final isPositive = change > 0;
+                    final color = isPositive ? Colors.greenAccent : Colors.red.shade300;
+                    final sign = isPositive ? '+' : '';
+                    final icon = isPositive ? Icons.arrow_upward : Icons.arrow_downward;
+                    
+                    return ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: Icon(icon, color: color),
+                      
+                      title: Text(coin, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                      
+                      subtitle: Row(
+                        children: [
+                          const Text(
+                            'Прогноз: ',
+                            style: TextStyle(color: Colors.white70, fontSize: 14),
+                          ),
+                          _buildLastHistoryIcon(coin),
+                        ],
+                      ),
+                      
+                      trailing: Text(
+                        '$sign${change.toStringAsFixed(2)}%',
+                        style: TextStyle(color: color, fontSize: 16, fontWeight: FontWeight.bold),
+                      ),
+                    );
+                  }).toList(),
+                ),
+              ),
+              actions: [
+                Text(
+                  '${countdown} с', 
+                  style: TextStyle(color: Colors.grey.shade600, fontSize: 14)),
+                const Spacer(),
+                TextButton(
+                  onPressed: () {
+                    dialogTimer?.cancel(); 
+                    Navigator.pop(context);
+                  },
+                  child: const Text('Закрыть', style: TextStyle(color: Colors.amber)),
+                ),
+              ],
+            );
+          },
+        );
+      }
+    ).then((_) {
+      dialogTimer?.cancel();
+      _isDialogShowing = false; 
+    });
+  }
+
+
+  void _calculatePortfolio() {
+    double total = 0;
+    for (var coin in _coins) {
+      final balance = _balances[coin] ?? 0;
+      final price = _prices[coin] ?? 0;
+      total += balance * price;
+    }
+    setState(() => _portfolioValue = total);
+  }
+  
+  void _addCoinDialog() {
+    final controller = TextEditingController();
+    _isDialogShowing = true; 
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1E1E1E),
+        title: const Text('Добавить монету', style: TextStyle(color: Colors.white)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Введите символ монеты (например: BTCUSDT, DOGSUSDT, NOTUSDT)',
+              style: TextStyle(color: Colors.grey, fontSize: 13),
+            ),
+            const SizedBox(height: 15),
+            TextField(
+              controller: controller,
+              style: const TextStyle(color: Colors.white),
+              decoration: const InputDecoration(
+                labelText: 'ID монеты',
+                labelStyle: TextStyle(color: Colors.grey),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              final id = controller.text.trim().toUpperCase();
+              if (id.isNotEmpty && !_coins.contains(id)) {
+                setState(() {
+                  _coins.add(id);
+                  _balances[id] = 0.0;
+                  _priceHistory[id] = []; 
+                  if (_selectedCoinForChart == null) {
+                      _selectedCoinForChart = id;
+                  }
+                });
+                _saveData();
+                _fetchPrices();
+              }
+              Navigator.pop(context);
+            },
+            child: const Text('Добавить', style: TextStyle(color: Colors.amber)),
+          ),
+        ],
+      ),
+    ).then((_) => _isDialogShowing = false); 
+  }
+
+  void _editBalanceDialog(String coin) {
+    final controller =
+        TextEditingController(text: _balances[coin]?.toString() ?? '0');
+    _isDialogShowing = true; 
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1E1E1E),
+        title: Text('Изменить баланс $coin',
+            style: const TextStyle(color: Colors.white)),
+        content: TextField(
+          controller: controller,
+          keyboardType: TextInputType.number,
+          style: const TextStyle(color: Colors.white),
+          decoration: const InputDecoration(
+            labelText: 'Количество монет',
+            labelStyle: TextStyle(color: Colors.grey),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              final value = double.tryParse(controller.text) ?? 0.0;
+              setState(() {
+                _balances[coin] = value;
+              });
+              _saveData();
+              _calculatePortfolio();
+              Navigator.pop(context);
+            },
+            child: const Text('Сохранить', style: TextStyle(color: Colors.amber)),
+          ),
+          TextButton(
+            onPressed: () {
+              setState(() {
+                _coins.remove(coin);
+                _balances.remove(coin);
+                _priceHistory.remove(coin); 
+                if (_selectedCoinForChart == coin) {
+                    _selectedCoinForChart = _coins.isNotEmpty ? _coins.first : null;
+                }
+              });
+              _saveData();
+              Navigator.pop(context);
+            },
+            child: const Text('Удалить монету', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    ).then((_) => _isDialogShowing = false); 
+  }
+
+  void _showAnalyticsDialog() {
+      if (_coins.isEmpty) {
+          _isDialogShowing = true;
+          showDialog(
+              context: context,
+              builder: (context) => AlertDialog(
+                  backgroundColor: const Color(0xFF1E1E1E),
+                  title: const Text('Аналитика', style: TextStyle(color: Colors.white)),
+                  content: const Text('Добавьте монеты в портфель, чтобы увидеть аналитику.', style: TextStyle(color: Colors.white70)),
+                  actions: [
+                      TextButton(
+                          onPressed: () => Navigator.pop(context),
+                          child: const Text('Закрыть', style: TextStyle(color: Colors.amber)),
+                      ),
+                  ],
+              )
+          ).then((_) => _isDialogShowing = false);
+          return;
+      }
+      
+      if (_selectedCoinForChart == null || !_coins.contains(_selectedCoinForChart)) {
+          _selectedCoinForChart = _coins.first;
+      }
+
+      _isDialogShowing = true;
+      showDialog(
+          context: context,
+          builder: (context) {
+              return StatefulBuilder(
+                  builder: (context, setStateSB) {
+                      final selectedCoin = _selectedCoinForChart!;
+                      // История от старой цены к новой (reversed)
+                      final historyData = (_priceHistory[selectedCoin] ?? []).reversed.toList(); 
+                      
+                      return AlertDialog(
+                          backgroundColor: const Color(0xFF1E1E1E),
+                          title: const Text('Аналитика цены (Live)', style: TextStyle(color: Colors.white)),
+                          content: SizedBox(
+                              width: 300,
+                              height: 300, 
+                              child: Column(
+                                  children: [
+                                      DropdownButtonFormField<String>(
+                                          value: selectedCoin,
+                                          dropdownColor: const Color(0xFF1E1E1E),
+                                          style: const TextStyle(color: Colors.white),
+                                          decoration: const InputDecoration(
+                                              labelText: 'Выберите монету',
+                                              labelStyle: TextStyle(color: Colors.amber),
+                                              border: OutlineInputBorder(),
+                                          ),
+                                          items: _coins.map((String coin) {
+                                              return DropdownMenuItem<String>(
+                                                  value: coin,
+                                                  child: Text(coin),
+                                              );
+                                          }).toList(),
+                                          onChanged: (String? newValue) {
+                                              if (newValue != null) {
+                                                  setStateSB(() {
+                                                      _selectedCoinForChart = newValue;
+                                                  });
+                                              }
+                                          },
+                                      ),
+                                      
+                                      const SizedBox(height: 20),
+                                      
+                                      // ❌ УДАЛЕН НЕОБНОВЛЯЕМЫЙ ТЕКСТ 
+                                      // const SizedBox(height: 10), // Убрали и этот отступ
+
+                                      // ValueListenableBuilder для "живого" обновления графика
+                                      Expanded(
+                                          child: historyData.length < 2
+                                              ? const Center(child: Text('Недостаточно данных для графика.', style: TextStyle(color: Colors.white70)))
+                                              : ValueListenableBuilder<int>(
+                                                  valueListenable: _chartUpdateNotifier,
+                                                  builder: (context, value, child) {
+                                                      // Получаем свежую историю для выбранной монеты
+                                                      final freshHistoryData = (_priceHistory[_selectedCoinForChart!] ?? []).reversed.toList();
+                                                      return CoinPriceChart(history: freshHistoryData);
+                                                  },
+                                              )
+                                      ), 
+                                  ],
+                              ),
+                          ),
+                          actions: [
+                              TextButton(
+                                  onPressed: () => Navigator.pop(context),
+                                  child: const Text('Закрыть', style: TextStyle(color: Colors.amber)),
+                              ),
+                          ],
+                      );
+                  },
+              );
+          }
+      ).then((_) => _isDialogShowing = false);
+  }
+
+  void _helpDialog() {
+    _isDialogShowing = true; 
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1E1E1E),
+        title: const Text('Справка и Поддержка', style: TextStyle(color: Colors.white)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Поддержка приложения:',
+                style: TextStyle(color: Colors.white70)),
+            TextButton(
+              onPressed: () => _launchUrl('https://t.me/cripto_karta'),
+              child: const Text('Чат телеграмм канала Крипто карта',
+                  style: TextStyle(
+                      color: Colors.amber,
+                      decoration: TextDecoration.underline)),
+            ),
+            const Divider(color: Colors.grey),
+            const Text('Исходный код GitHub:',
+                style: TextStyle(color: Colors.white70)),
+            TextButton(
+              onPressed: () => _launchUrl('https://github.com/pavekscb'),
+              child: const Text('https://github.com/pavekscb',
+                  style: TextStyle(
+                      color: Colors.amber,
+                      decoration: TextDecoration.underline)),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Закрыть', style: TextStyle(color: Colors.amber)),
+          ),
+        ],
+      ),
+    ).then((_) => _isDialogShowing = false); 
+  }
+
+  void _settingsDialog() {
+    double tempInterval = _refreshInterval.toDouble();
+    bool tempNotificationsEnabled = _notificationsEnabled; 
+    double tempNotificationThreshold = _notificationThreshold; 
+    double tempNotificationDuration = _notificationDuration.toDouble(); 
+
+    _isDialogShowing = true; 
+    showDialog(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setStateSB) {
+          return AlertDialog(
+            backgroundColor: const Color(0xFF1E1E1E),
+            title: const Text('Настройки', style: TextStyle(color: Colors.white)),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Уведомления о цене', style: TextStyle(color: Colors.white)),
+                  value: tempNotificationsEnabled,
+                  onChanged: (bool value) {
+                    setStateSB(() {
+                      tempNotificationsEnabled = value;
+                    });
+                  },
+                  activeColor: Colors.amber,
+                ),
+                
+                const SizedBox(height: 10),
+                const Text('Порог изменения цены для уведомлений:',
+                    style: TextStyle(color: Colors.white70)),
+                Text(
+                  '${tempNotificationThreshold.toStringAsFixed(2)}%',
+                  style: const TextStyle(
+                      color: Colors.amber,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold),
+                ),
+                Slider(
+                  value: tempNotificationThreshold,
+                  min: 0.01,
+                  max: 1.0, 
+                  divisions: 99, 
+                  label: '${tempNotificationThreshold.toStringAsFixed(2)}%',
+                  onChanged: (double newValue) {
+                    setStateSB(() {
+                      tempNotificationThreshold = newValue;
+                    });
+                  },
+                  activeColor: Colors.amber,
+                  inactiveColor: Colors.grey[700],
+                ),
+                
+                const Divider(color: Colors.grey),
+                
+                const Text('Время показа уведомления:',
+                    style: TextStyle(color: Colors.white70)),
+                Text(
+                  '${tempNotificationDuration.toInt()} секунд',
+                  style: const TextStyle(
+                      color: Colors.amber,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold),
+                ),
+                Slider(
+                  value: tempNotificationDuration,
+                  min: 1,
+                  max: 10, 
+                  divisions: 9, 
+                  label: '${tempNotificationDuration.toInt()} с',
+                  onChanged: (double newValue) {
+                    setStateSB(() {
+                      tempNotificationDuration = newValue;
+                    });
+                  },
+                  activeColor: Colors.amber,
+                  inactiveColor: Colors.grey[700],
+                ),
+
+                const Divider(color: Colors.grey),
+
+                const Text('Интервал обновления цен:',
+                    style: TextStyle(color: Colors.white70)),
+                Text(
+                  '${tempInterval.toInt()} секунд',
+                  style: const TextStyle(
+                      color: Colors.amber,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold),
+                ),
+                Slider(
+                  value: tempInterval,
+                  min: 10,
+                  max: 100, 
+                  divisions: (100 - 10), 
+                  label: '${tempInterval.toInt()} с',
+                  onChanged: (double newValue) {
+                    setStateSB(() {
+                      tempInterval = newValue;
+                    });
+                  },
+                  activeColor: Colors.amber,
+                  inactiveColor: Colors.grey[700],
+                ),
+                
+                const Divider(color: Colors.grey),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  setState(() {
+                    _refreshInterval = tempInterval.toInt();
+                    _seconds = _refreshInterval; 
+                    _notificationsEnabled = tempNotificationsEnabled;
+                    _notificationThreshold = tempNotificationThreshold;
+                    _notificationDuration = tempNotificationDuration.toInt(); 
+                  });
+                  _saveData();
+                  _startTimer();
+                  Navigator.pop(context);
+                },
+                child: const Text('Сохранить', style: TextStyle(color: Colors.amber)),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Отмена', style: TextStyle(color: Colors.white70)),
+              ),
+            ],
+          );
+        },
+      ),
+    ).then((_) => _isDialogShowing = false); 
+  }
+
+  Future<void> _launchUrl(String urlString) async {
+    final Uri url = Uri.parse(urlString);
+    if (await canLaunchUrl(url)) {
+      await launchUrl(url, mode: LaunchMode.externalApplication);
+    } else {
+      debugPrint('Не удалось открыть $urlString');
+    }
+  }
+
+  String _formatChange(double? change) {
+    if (change == null) return '0.00%';
+    final sign = change > 0 ? '+' : '';
+    return '$sign${change.toStringAsFixed(2)}%';
+  }
+
+  TextSpan _buildColoredChange(double? change) {
+    if (change == null) {
+      return const TextSpan(text: '0.00%', style: TextStyle(color: Colors.grey));
+    }
+    Color color = Colors.grey;
+    String arrow = '';
+    if (change > 0) {
+      color = Colors.greenAccent;
+      arrow = ' ▲';
+    } else if (change < 0) {
+      color = Colors.red.shade300!;
+      arrow = ' ▼';
+    }
+    return TextSpan(
+      text: '${_formatChange(change)}$arrow',
+      style: TextStyle(color: color),
+    );
+  }
+
+  Widget _buildLastHistoryIcon(String coin) {
+      final history = _priceHistory[coin] ?? [];
+      if (history.length < 2) {
+        return const Text('—', style: TextStyle(color: Colors.grey, fontSize: 14));
+      }
+
+      Color color = Colors.grey;
+      String arrow = '—';
+
+      if (history[0] > history[1]) {
+        color = Colors.greenAccent;
+        arrow = '▲'; 
+      } else if (history[0] < history[1]) {
+        color = Colors.red.shade300!;
+        arrow = '▼';
+      }
+      
+      return Text(
+        arrow,
+        style: TextStyle(color: color, fontSize: 14),
+      );
+  }
+
+  Widget _buildPriceHistoryIcons(String coin) {
+    final history = _priceHistory[coin] ?? [];
+    if (history.length < 2) {
+      return const Text('Нет данных', style: TextStyle(color: Colors.grey));
+    }
+
+    List<Widget> icons = [];
+    
+    for (int i = 0; i < history.length - 1; i++) {
+      Color color = Colors.grey;
+      String arrow = '—';
+
+      if (history[i] > history[i + 1]) {
+        color = Colors.greenAccent;
+        arrow = '▲'; 
+      } else if (history[i] < history[i + 1]) {
+        color = Colors.red.shade300!;
+        arrow = '▼';
+      }
+      
+      icons.insert(0, Padding( 
+        padding: const EdgeInsets.only(left: 2),
+        child: Text(
+          arrow,
+          style: TextStyle(color: color, fontSize: 14),
+        ),
+      ));
+    }
+    
+    if (icons.length > 10) {
+      icons = icons.sublist(icons.length - 10);
+    }
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: icons,
+    );
+  }
+  
+  Future<void> _launchBinance(String coin) async {
+    final url = 'https://www.binance.com/en/trade/${coin.toUpperCase()}?type=spot';
+    if (await canLaunchUrl(Uri.parse(url))) {
+      await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _chartUpdateNotifier.dispose(); 
+    super.dispose();
+  }
+
+  Future<void> _refresh() async {
+    setState(() => _seconds = _refreshInterval);
+    _startTimer();
+    await _fetchPrices();
+  }
+
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        // ✅ ИМЯ ПРИЛОЖЕНИЯ
+        title: const Text('CryptoEcho'), 
+        actions: [
+          IconButton(onPressed: _addCoinDialog, icon: const Icon(Icons.add)),
+          IconButton(onPressed: _showAnalyticsDialog, icon: const Icon(Icons.bar_chart)), 
+          IconButton(onPressed: _helpDialog, icon: const Icon(Icons.help_outline)), 
+          IconButton(onPressed: _settingsDialog, icon: const Icon(Icons.settings)),
+        ],
+      ),
+      body: RefreshIndicator(
+        onRefresh: _refresh,
+        color: Colors.amber,
+        child: ListView(
+          children: [
+            for (var coin in _coins)
+              Card(
+                color: const Color(0xFF1E1E1E),
+                margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                child: ListTile(
+                  onTap: () => _editBalanceDialog(coin),
+                  onLongPress: () => _launchBinance(coin),
+                  
+                  title: RichText(
+                    overflow: TextOverflow.ellipsis,
+                    text: TextSpan(
+                      style: const TextStyle(color: Colors.white70, fontSize: 14),
+                      children: [
+                        TextSpan(
+                          text: '$coin',
+                          style: const TextStyle(
+                              color: Colors.white, fontWeight: FontWeight.bold),
+                        ),
+                        const TextSpan(text: ' - Изм.: 24 ч: '),
+                        _buildColoredChange(_dayChange[coin]),
+                      ],
+                    ),
+                  ),
+                  
+                  subtitle: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Цена: \$${_prices[coin]?.toStringAsFixed(8) ?? '—'}',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 18,
+                        ),
+                      ),
+                      
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            'Стоимость: \$${((_balances[coin] ?? 0) * (_prices[coin] ?? 0)).toStringAsFixed(2)}',
+                            style: const TextStyle(color: Colors.amber, fontSize: 16, fontWeight: FontWeight.bold),
+                          ),
+                          Text(
+                            '${_balances[coin]?.toStringAsFixed(4) ?? '0'}',
+                            style: const TextStyle(color: Colors.amber, fontSize: 16),
+                          ),
+                        ],
+                      ),
+                      
+                      const SizedBox(height: 4),
+                      Row(
+                        children: [
+                          const Text(
+                            'Прогноз: ',
+                            style: TextStyle(color: Colors.white70, fontSize: 14),
+                          ),
+                          _buildPriceHistoryIcons(coin), 
+                        ],
+                      ),
+                      
+                      RichText(
+                        text: TextSpan(
+                          style: const TextStyle(color: Colors.grey, fontSize: 14),
+                          children: [
+                            const TextSpan(text: 'Тренд за интервал: '),
+                            _buildColoredChange(_intervalChange[coin]),
+                          ]
+                        ),
+                      ),
+                    ],
+                  ),
+                  
+                  trailing: const SizedBox.shrink(), 
+                ),
+              ),
+            const Divider(color: Colors.grey),
+            
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text(
+                    'Общая сумма:',
+                    style: TextStyle(
+                        fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white),
+                  ),
+                  Flexible(
+                    child: Text(
+                      '\$${_portfolioValue.toStringAsFixed(2)}',
+                      overflow: TextOverflow.ellipsis,
+                      textAlign: TextAlign.right,
+                      style: const TextStyle(
+                          fontSize: 22,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.amberAccent),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: LinearProgressIndicator(
+                value: _seconds / _refreshInterval,
+                color: Colors.amberAccent,
+                backgroundColor: Colors.grey[800],
+                minHeight: 6,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Center(
+              child: TextButton(
+                onPressed: _refresh,
+                child: Text(
+                  'Обновление через: $_seconds с',
+                  style: const TextStyle(color: Colors.white70),
+                ),
+              ),
+            ),
+            const SizedBox(height: 20),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+
+// ----------------------------------------------------------------------
+// ВИДЖЕТ: Простой линейный график с CustomPainter
+// ----------------------------------------------------------------------
+
+class CoinPriceChart extends StatelessWidget {
+    final List<double> history; 
+
+    const CoinPriceChart({required this.history, super.key});
+
+    @override
+    Widget build(BuildContext context) {
+        return CustomPaint(
+            painter: LineChartPainter(history: history),
+            child: Container(),
+        );
+    }
+}
+
+class LineChartPainter extends CustomPainter {
+    final List<double> history;
+
+    LineChartPainter({required this.history});
+
+    // Хелпер для рисования пунктирных линий
+    void _drawDashedPath(Canvas canvas, Path path, Paint paint, double dash, double gap) {
+        final ui.PathMetrics metrics = path.computeMetrics(); 
+        for (final ui.PathMetric metric in metrics) { 
+            double distance = 0.0;
+            while (distance < metric.length) {
+                canvas.drawPath(
+                    metric.extractPath(distance, distance + dash),
+                    paint,
+                );
+                distance += dash + gap;
+            }
+        }
+    }
+
+    @override
+    void paint(Canvas canvas, Size size) {
+        if (history.length < 2) return;
+
+        final minPrice = history.reduce((a, b) => a < b ? a : b);
+        final maxPrice = history.reduce((a, b) => a > b ? a : b);
+        final range = maxPrice - minPrice;
+        
+        const int numPredictionPoints = 3; 
+        // ✅ НОВЫЙ РАСЧЕТ: Общее количество интервалов, чтобы уместить историю + прогноз
+        final int totalIntervals = (history.length > 0 ? history.length - 1 : 0) + numPredictionPoints; 
+
+        final stepX = totalIntervals > 0 ? size.width / totalIntervals : size.width;
+        
+        // --- 1. Вспомогательная функция Y-координаты ---
+        double getY(double price) {
+            if (range == 0) return size.height / 2;
+            final normalized = (price - minPrice) / range;
+            return size.height * (1.0 - normalized); 
+        }
+
+        // --- 2. Рисование исторической линии (сплошная) ---
+        final historyPaint = Paint()
+            ..color = history.last > history.first ? Colors.greenAccent : Colors.red.shade300!
+            ..strokeWidth = 2.0
+            ..style = PaintingStyle.stroke;
+            
+        final historyPath = Path();
+        historyPath.moveTo(0, getY(history.first));
+
+        for (int i = 1; i < history.length; i++) {
+            historyPath.lineTo(i * stepX, getY(history[i])); // Используем новый stepX
+        }
+
+        canvas.drawPath(historyPath, historyPaint);
+        
+        // Новая координата X для последней точки истории
+        final lastX = (history.length - 1) * stepX; 
+        final lastY = getY(history.last);
+        canvas.drawCircle(Offset(lastX, lastY), 4.0, Paint()..color = historyPaint.color..style = PaintingStyle.fill);
+
+        // --- 3. Вспомогательная функция для отрисовки одного прогнозного сценария ---
+        
+        if (history.length < 2) return;
+
+        // Разница в цене между последней и предпоследней точкой (текущий тренд)
+        final double deltaPrice = history.last - history[history.length - 2]; 
+
+        void drawForecast(double initialDelta, Color color) {
+            final forecastPaint = Paint()
+                ..color = color
+                ..strokeWidth = 2.0
+                ..style = PaintingStyle.stroke;
+
+            final forecastPath = Path();
+            forecastPath.moveTo(lastX, lastY); // Начинаем с последней точки истории
+            
+            double currentPrice = history.last;
+            double currentX = lastX;
+            
+            for (int i = 1; i <= numPredictionPoints; i++) {
+                currentPrice += initialDelta; 
+                currentX += stepX; // Продолжаем использовать тот же stepX
+                
+                // Прогнозные точки тоже должны быть в разумном Y-диапазоне 
+                final dynamicRange = range == 0 ? 0.01 : range;
+                double predictedPrice = currentPrice.clamp(minPrice - dynamicRange * 0.1, maxPrice + dynamicRange * 0.1);
+
+                forecastPath.lineTo(currentX, getY(predictedPrice));
+            }
+
+            _drawDashedPath(canvas, forecastPath, forecastPaint, 6.0, 4.0);
+        }
+        
+        // --- 4. Рисование прогнозных линий (пунктир) ---
+        
+        // 4a. Положительный прогноз (продолжение текущего тренда)
+        drawForecast(deltaPrice, Colors.amber.shade300);
+
+        // 4b. Негативный/Медвежий прогноз (реверс последнего изменения)
+        drawForecast(-deltaPrice, Colors.red.shade400.withOpacity(0.5)); 
+    }
+
+    @override
+    bool shouldRepaint(covariant LineChartPainter oldDelegate) {
+        return oldDelegate.history != history;
+    }
+}
