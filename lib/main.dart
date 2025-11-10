@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:ui' as ui; 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'; // ✅ ДОБАВЛЕНО для Clipboard
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -196,7 +197,7 @@ class _PortfolioPageState extends State<PortfolioPage> {
   }
 
   void _showPriceAlertDialog(Map<String, double> alerts) {
-    if (_isDialogShowing) {
+    if (_isDialogShowing || alerts.isEmpty) { // ✅ ИСПРАВЛЕНИЕ 1: Не вызывать, если пусто
         return;
     }
     
@@ -233,40 +234,42 @@ class _PortfolioPageState extends State<PortfolioPage> {
                   style: TextStyle(color: Colors.amber, fontWeight: FontWeight.bold)),
               
               content: SizedBox(
-                width: double.maxFinite,
-                child: ListView(
-                  shrinkWrap: true,
-                  children: alerts.entries.map((entry) {
-                    final coin = entry.key;
-                    final change = entry.value;
-                    final isPositive = change > 0;
-                    final color = isPositive ? Colors.greenAccent : Colors.red.shade300;
-                    final sign = isPositive ? '+' : '';
-                    final icon = isPositive ? Icons.arrow_upward : Icons.arrow_downward;
-                    
-                    return ListTile(
-                      contentPadding: EdgeInsets.zero,
-                      leading: Icon(icon, color: color),
-                      
-                      title: Text(coin, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-                      
-                      subtitle: Row(
-                        children: [
-                          const Text(
-                            'Прогноз: ',
-                            style: TextStyle(color: Colors.white70, fontSize: 14),
-                          ),
-                          _buildLastHistoryIcon(coin),
-                        ],
-                      ),
-                      
-                      trailing: Text(
-                        '$sign${change.toStringAsFixed(2)}%',
-                        style: TextStyle(color: color, fontSize: 16, fontWeight: FontWeight.bold),
-                      ),
-                    );
-                  }).toList(),
-                ),
+                  // ✅ ИСПРАВЛЕНИЕ 2: Явно задаем высоту, чтобы избежать проблем рендеринга
+                  height: alerts.length * 70.0, 
+                  width: double.maxFinite,
+                  child: ListView(
+                      shrinkWrap: true,
+                      children: alerts.entries.map((entry) {
+                          final coin = entry.key;
+                          final change = entry.value;
+                          final isPositive = change > 0;
+                          final color = isPositive ? Colors.greenAccent : Colors.red.shade300;
+                          final sign = isPositive ? '+' : '';
+                          final icon = isPositive ? Icons.arrow_upward : Icons.arrow_downward;
+                          
+                          return ListTile(
+                              contentPadding: EdgeInsets.zero,
+                              leading: Icon(icon, color: color),
+                              
+                              title: Text(coin, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                              
+                              subtitle: Row(
+                                  children: [
+                                      const Text(
+                                          'Прогноз: ',
+                                          style: TextStyle(color: Colors.white70, fontSize: 14),
+                                      ),
+                                      _buildLastHistoryIcon(coin),
+                                  ],
+                              ),
+                              
+                              trailing: Text(
+                                  '$sign${change.toStringAsFixed(2)}%',
+                                  style: TextStyle(color: color, fontSize: 16, fontWeight: FontWeight.bold),
+                              ),
+                          );
+                      }).toList(),
+                  ),
               ),
               actions: [
                 Text(
@@ -442,10 +445,10 @@ class _PortfolioPageState extends State<PortfolioPage> {
                       
                       return AlertDialog(
                           backgroundColor: const Color(0xFF1E1E1E),
-                          title: const Text('Аналитика цены (Live)', style: TextStyle(color: Colors.white)),
+                          title: Text('Аналитика цены (Live) - $selectedCoin', style: const TextStyle(color: Colors.white)), // Добавлено имя монеты
                           content: SizedBox(
                               width: 300,
-                              height: 300, 
+                              height: 350, // Немного увеличена высота для лучшего отображения подписей
                               child: Column(
                                   children: [
                                       DropdownButtonFormField<String>(
@@ -474,9 +477,6 @@ class _PortfolioPageState extends State<PortfolioPage> {
                                       
                                       const SizedBox(height: 20),
                                       
-                                      // ❌ УДАЛЕН НЕОБНОВЛЯЕМЫЙ ТЕКСТ 
-                                      // const SizedBox(height: 10), // Убрали и этот отступ
-
                                       // ValueListenableBuilder для "живого" обновления графика
                                       Expanded(
                                           child: historyData.length < 2
@@ -486,7 +486,11 @@ class _PortfolioPageState extends State<PortfolioPage> {
                                                   builder: (context, value, child) {
                                                       // Получаем свежую историю для выбранной монеты
                                                       final freshHistoryData = (_priceHistory[_selectedCoinForChart!] ?? []).reversed.toList();
-                                                      return CoinPriceChart(history: freshHistoryData);
+                                                      final currentPrice = _prices[_selectedCoinForChart!] ?? 0.0;
+                                                      return CoinPriceChart(
+                                                          history: freshHistoryData,
+                                                          currentPrice: currentPrice, // Передаем текущую цену
+                                                      );
                                                   },
                                               )
                                       ), 
@@ -507,6 +511,7 @@ class _PortfolioPageState extends State<PortfolioPage> {
   }
 
   void _helpDialog() {
+    const String evmWallet = '0x3EB6aA29C796A8271C5A5ab84bEe4f91df280632'; // ✅ EVM Кошелек
     _isDialogShowing = true; 
     showDialog(
       context: context,
@@ -526,12 +531,50 @@ class _PortfolioPageState extends State<PortfolioPage> {
                       color: Colors.amber,
                       decoration: TextDecoration.underline)),
             ),
+            
+            // --- НОВЫЙ РАЗДЕЛ ПОМОЩЬ ПРОЕКТУ ---
             const Divider(color: Colors.grey),
-            const Text('Исходный код GitHub:',
-                style: TextStyle(color: Colors.white70)),
-            TextButton(
-              onPressed: () => _launchUrl('https://github.com/pavekscb'),
-              child: const Text('https://github.com/pavekscb',
+            const Text(
+                'Помочь проекту',
+                style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 16),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+                'Ваша поддержка помогает нам развивать приложение. Вы можете отправить любые токены/монеты, совместимые с EVM (Ethereum, BSC, Polygon и т.д.), на адрес ниже.',
+                style: TextStyle(color: Colors.white70, fontSize: 13),
+            ),
+            const SizedBox(height: 8),
+            Row(
+                children: [
+                    Expanded(
+                        child: SelectableText( // Для удобства копирования
+                            evmWallet,
+                            style: const TextStyle(color: Colors.greenAccent, fontSize: 12),
+                        ),
+                    ),
+                    IconButton(
+                        icon: const Icon(Icons.copy, color: Colors.amber, size: 20),
+                        onPressed: () {
+                            Clipboard.setData(const ClipboardData(text: evmWallet));
+                            ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                    content: Text('Адрес EVM кошелька скопирован!'),
+                                    duration: Duration(seconds: 2),
+                                ),
+                            );
+                        },
+                    ),
+                ],
+            ),
+            // --- КОНЕЦ НОВОГО РАЗДЕЛА ---
+
+            const Divider(color: Colors.grey),
+             TextButton(
+              onPressed: () => _launchUrl('https://github.com/pavekscb/cryptoecho/releases'),
+              child: const Text('ПОСЛЕДНЯЯ ВЕРСИЯ (.APK)',
                   style: TextStyle(
                       color: Colors.amber,
                       decoration: TextDecoration.underline)),
@@ -859,15 +902,27 @@ class _PortfolioPageState extends State<PortfolioPage> {
                       
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        crossAxisAlignment: CrossAxisAlignment.start, // ✅ ИЗМЕНЕНИЕ 1: Для лучшей верстки
                         children: [
-                          Text(
-                            'Стоимость: \$${((_balances[coin] ?? 0) * (_prices[coin] ?? 0)).toStringAsFixed(2)}',
-                            style: const TextStyle(color: Colors.amber, fontSize: 16, fontWeight: FontWeight.bold),
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'Стоимость: \$${((_balances[coin] ?? 0) * (_prices[coin] ?? 0)).toStringAsFixed(2)}',
+                                style: const TextStyle(color: Colors.amber, fontSize: 16, fontWeight: FontWeight.bold),
+                              ),
+                              // ✅ ИЗМЕНЕНИЕ 1: Вывод баланса под стоимостью с сокращенной точностью
+                              Text( 
+                                '${_balances[coin]?.toStringAsFixed(2) ?? '0.00'} ${_coins.contains(coin) ? coin.replaceAll('USDT', '') : ''}', // 100.01 BTC
+                                style: const TextStyle(color: Colors.amber, fontSize: 14),
+                              ),
+                            ],
                           ),
-                          Text(
-                            '${_balances[coin]?.toStringAsFixed(4) ?? '0'}',
-                            style: const TextStyle(color: Colors.amber, fontSize: 16),
-                          ),
+                          // Text(
+                          //   '${_balances[coin]?.toStringAsFixed(4) ?? '0'}', // УДАЛЕНО: Перенесено в Column
+                          //   style: const TextStyle(color: Colors.amber, fontSize: 16),
+                          // ),
+                          
                         ],
                       ),
                       
@@ -959,13 +1014,14 @@ class _PortfolioPageState extends State<PortfolioPage> {
 
 class CoinPriceChart extends StatelessWidget {
     final List<double> history; 
+    final double currentPrice; 
 
-    const CoinPriceChart({required this.history, super.key});
+    const CoinPriceChart({required this.history, required this.currentPrice, super.key});
 
     @override
     Widget build(BuildContext context) {
         return CustomPaint(
-            painter: LineChartPainter(history: history),
+            painter: LineChartPainter(history: history, currentPrice: currentPrice),
             child: Container(),
         );
     }
@@ -973,8 +1029,9 @@ class CoinPriceChart extends StatelessWidget {
 
 class LineChartPainter extends CustomPainter {
     final List<double> history;
+    final double currentPrice; 
 
-    LineChartPainter({required this.history});
+    LineChartPainter({required this.history, required this.currentPrice});
 
     // Хелпер для рисования пунктирных линий
     void _drawDashedPath(Canvas canvas, Path path, Paint paint, double dash, double gap) {
@@ -990,29 +1047,197 @@ class LineChartPainter extends CustomPainter {
             }
         }
     }
+    
+    // ✅ Расчет вероятностей на основе последних 5 интервалов
+    Map<String, int> _calculateForecastProbabilities() {
+        if (history.length < 3) return {'same': 50, 'reverse': 50}; // Дефолт 50/50
+
+        // Определяем направление последнего движения (которое мы продолжаем/реверсируем)
+        final bool lastMoveUp = history.last > history[history.length - 2];
+
+        // Анализируем последние 5 интервалов
+        int sameDirectionCount = 0;
+        int oppositeDirectionCount = 0;
+        
+        // Начинаем с предпоследней точки (интервал history[i-1] -> history[i])
+        for (int i = history.length - 2; i >= 1 && i >= history.length - 6; i--) {
+            final bool currentMoveUp = history[i] > history[i - 1];
+            if (currentMoveUp == lastMoveUp) {
+                sameDirectionCount++;
+            } else {
+                oppositeDirectionCount++;
+            }
+        }
+        
+        final int totalRecent = sameDirectionCount + oppositeDirectionCount;
+        if (totalRecent == 0) return {'same': 50, 'reverse': 50}; 
+
+        // Эвристика: 50% + 5% * (кол-во совпадений - кол-во несовпадений)
+        final int difference = sameDirectionCount - oppositeDirectionCount;
+        final int adjustment = difference * 5; 
+        
+        final int pSame = (50 + adjustment).clamp(25, 75); // Ограничиваем 25% и 75%
+        final int pReverse = 100 - pSame;
+        
+        return {'same': pSame, 'reverse': pReverse};
+    }
+
+    // Хелпер для форматирования цены (✅ УСЛОВНАЯ ТОЧНОСТЬ)
+    String _formatPrice(double price) {
+        if (price >= 1000) {
+            return price.toStringAsFixed(2); // Высокая цена: меньше точность (105306.12)
+        } else if (price >= 1) {
+            return price.toStringAsFixed(4); // Средняя цена: 4 знака (3.2312)
+        } else if (price >= 0.001) {
+            return price.toStringAsFixed(4);
+        } else {
+            return price.toStringAsFixed(8); 
+        }
+    }
+
+
+    // ✅ Модифицированный drawForecast для отрисовки процента и сдвига текста
+    void _drawForecast(Canvas canvas, Size size, double initialDelta, Color color, int probability, double lastX, double lastY, double stepX, double actualMin, double actualMax, double actualRange, Function(double) getY, double yOffsetAdjustment) {
+        const int numPredictionPoints = 3; 
+
+        final forecastPaint = Paint()
+            ..color = color
+            ..strokeWidth = 2.0
+            ..style = PaintingStyle.stroke;
+
+        final forecastPath = Path();
+        forecastPath.moveTo(lastX, lastY); // Начинаем с последней точки истории
+        
+        double currentPrice = history.last;
+        double currentX = lastX;
+        
+        final double actualMinForClamp = actualMin;
+        final double actualMaxForClamp = actualMax;
+
+        // Точки для расчета центральной Y-координаты текста
+        double price1 = 0.0, price2 = 0.0;
+        
+        for (int i = 1; i <= numPredictionPoints; i++) {
+            currentPrice += initialDelta; 
+            currentX += stepX; 
+            
+            // Клампим цену для отрисовки, чтобы она оставалась в разумном диапазоне
+            double predictedPrice = currentPrice.clamp(actualMinForClamp, actualMaxForClamp);
+
+            forecastPath.lineTo(currentX, getY(predictedPrice));
+            
+            if (i == 1) price1 = predictedPrice;
+            if (i == 2) price2 = predictedPrice;
+        }
+
+        _drawDashedPath(canvas, forecastPath, forecastPaint, 6.0, 4.0);
+        
+        // --- Рисование процента вероятности ---
+        
+        // Находим приблизительную среднюю точку на прогнозной линии
+        final double midX = lastX + 1.5 * stepX; 
+        final double midY = (getY(price1) + getY(price2)) / 2.0; 
+        
+        final textPainter = TextPainter(
+            text: TextSpan(
+                text: '${probability}%',
+                style: TextStyle(
+                    color: color.withOpacity(0.9), 
+                    fontSize: 20.0, 
+                    fontWeight: FontWeight.bold,
+                    shadows: const [ 
+                        Shadow(
+                            blurRadius: 1.0,
+                            color: Colors.black,
+                            offset: Offset(0, 0),
+                        )
+                    ]
+                ),
+            ),
+            textDirection: TextDirection.ltr,
+        );
+        textPainter.layout();
+        
+        // Рисуем текст немного выше средней точки + применяем вертикальный сдвиг для предотвращения наложения
+        textPainter.paint(
+            canvas, 
+            Offset(midX - textPainter.width / 2, midY - textPainter.height - 3 + yOffsetAdjustment),
+        );
+    }
+
 
     @override
     void paint(Canvas canvas, Size size) {
         if (history.length < 2) return;
-
-        final minPrice = history.reduce((a, b) => a < b ? a : b);
-        final maxPrice = history.reduce((a, b) => a > b ? a : b);
-        final range = maxPrice - minPrice;
         
+        // Отступы для меток по оси Y (справа)
+        const double labelWidth = 50.0; 
+        final chartWidth = size.width - labelWidth;
+        final chartHeight = size.height;
+
+        // Определяем диапазон, включая потенциальный небольшой буфер
+        final double minPrice = history.reduce((a, b) => a < b ? a : b);
+        final double maxPrice = history.reduce((a, b) => a > b ? a : b);
+        final double range = maxPrice - minPrice;
+        
+        final double buffer = range * 0.1; // 10% буфер
+        final double actualMin = minPrice - buffer;
+        final double actualMax = maxPrice + buffer;
+        final double actualRange = actualMax - actualMin;
+
         const int numPredictionPoints = 3; 
-        // ✅ НОВЫЙ РАСЧЕТ: Общее количество интервалов, чтобы уместить историю + прогноз
         final int totalIntervals = (history.length > 0 ? history.length - 1 : 0) + numPredictionPoints; 
 
-        final stepX = totalIntervals > 0 ? size.width / totalIntervals : size.width;
+        final double stepX = totalIntervals > 0 ? chartWidth / totalIntervals : chartWidth;
         
         // --- 1. Вспомогательная функция Y-координаты ---
         double getY(double price) {
-            if (range == 0) return size.height / 2;
-            final normalized = (price - minPrice) / range;
-            return size.height * (1.0 - normalized); 
+            if (actualRange == 0) return chartHeight / 2;
+            final normalized = (price - actualMin) / actualRange;
+            // Инвертируем, так как (0,0) вверху
+            return chartHeight * (1.0 - normalized); 
+        }
+        
+        // --- 2. Рисование сетки и меток (Оси Y) (✅ УМЕНЬШЕН ШРИФТ) ---
+        final gridPaint = Paint()
+            ..color = Colors.grey.withOpacity(0.15)
+            ..strokeWidth = 0.5
+            ..style = PaintingStyle.stroke;
+            
+        const int numLines = 5; // 5 горизонтальных линий
+        
+        // Цены для подписей
+        final double priceStep = actualRange / (numLines - 1);
+        
+        for (int i = 0; i < numLines; i++) {
+            final double price = actualMin + priceStep * i;
+            final double y = getY(price);
+
+            // Рисование сетки
+            canvas.drawLine(Offset(0, y), Offset(chartWidth, y), gridPaint);
+
+            // Рисование меток цен справа
+            final textPainter = TextPainter(
+                text: TextSpan(
+                    text: _formatPrice(price),
+                    style: TextStyle(
+                        color: Colors.white70,
+                        fontSize: 10.0, // ИЗМЕНЕНИЕ: Уменьшен до 10.0 для умещения крупных цен
+                        fontWeight: FontWeight.w300,
+                    ),
+                ),
+                textDirection: TextDirection.ltr,
+            );
+            textPainter.layout();
+            
+            // Выравнивание по правому краю области графика
+            textPainter.paint(
+                canvas,
+                Offset(chartWidth + 5.0, y - textPainter.height / 2),
+            );
         }
 
-        // --- 2. Рисование исторической линии (сплошная) ---
+        // --- 3. Рисование исторической линии (сплошная) ---
         final historyPaint = Paint()
             ..color = history.last > history.first ? Colors.greenAccent : Colors.red.shade300!
             ..strokeWidth = 2.0
@@ -1022,7 +1247,7 @@ class LineChartPainter extends CustomPainter {
         historyPath.moveTo(0, getY(history.first));
 
         for (int i = 1; i < history.length; i++) {
-            historyPath.lineTo(i * stepX, getY(history[i])); // Используем новый stepX
+            historyPath.lineTo(i * stepX, getY(history[i]));
         }
 
         canvas.drawPath(historyPath, historyPaint);
@@ -1030,52 +1255,65 @@ class LineChartPainter extends CustomPainter {
         // Новая координата X для последней точки истории
         final lastX = (history.length - 1) * stepX; 
         final lastY = getY(history.last);
-        canvas.drawCircle(Offset(lastX, lastY), 4.0, Paint()..color = historyPaint.color..style = PaintingStyle.fill);
-
-        // --- 3. Вспомогательная функция для отрисовки одного прогнозного сценария ---
         
-        if (history.length < 2) return;
+        // Рисуем точку на текущей цене
+        canvas.drawCircle(Offset(lastX, lastY), 4.0, Paint()..color = historyPaint.color..style = PaintingStyle.fill);
+        
+        // --- 4. Метка текущей цены (✅ СДВИНУТА ВЛЕВО) ---
+        final currentPricePainter = TextPainter(
+            text: TextSpan(
+                text: _formatPrice(currentPrice),
+                style: TextStyle(
+                    color: Colors.amber, 
+                    fontSize: 20.0, 
+                    fontWeight: FontWeight.bold,
+                ),
+            ),
+            textDirection: TextDirection.ltr,
+        );
+        currentPricePainter.layout();
+        
+        // Рисуем над точкой, сдвигая центр на 15.0 влево
+        currentPricePainter.paint(
+            canvas, 
+            Offset(lastX - currentPricePainter.width / 2 - 15.0, lastY - 15), 
+        );
+
+
+        // --- 5. Рисование прогнозных линий (пунктир) ---
+        
+        final Map<String, int> probabilities = _calculateForecastProbabilities();
+        final int pSameTrend = probabilities['same']!;
+        final int pReverseTrend = probabilities['reverse']!;
 
         // Разница в цене между последней и предпоследней точкой (текущий тренд)
         final double deltaPrice = history.last - history[history.length - 2]; 
 
-        void drawForecast(double initialDelta, Color color) {
-            final forecastPaint = Paint()
-                ..color = color
-                ..strokeWidth = 2.0
-                ..style = PaintingStyle.stroke;
+        if (deltaPrice >= 0) {
+            // Сценарий 1: Продолжение тренда (UP) - ВЕРХНЯЯ линия
+            final Color color1 = Colors.greenAccent; 
+            // Сдвиг вверх (отрицательное значение)
+            _drawForecast(canvas, size, deltaPrice, color1, pSameTrend, lastX, lastY, stepX, actualMin, actualMax, actualRange, getY, -25.0); 
 
-            final forecastPath = Path();
-            forecastPath.moveTo(lastX, lastY); // Начинаем с последней точки истории
+            // Сценарий 2: Реверс тренда (DOWN) - НИЖНЯЯ линия
+            final Color color2 = Colors.red.shade400.withOpacity(0.5); 
+            // Сдвиг вниз (положительное значение)
+            _drawForecast(canvas, size, -deltaPrice, color2, pReverseTrend, lastX, lastY, stepX, actualMin, actualMax, actualRange, getY, 25.0); 
+        } else {
+            // Сценарий 1: Продолжение тренда (DOWN) - НИЖНЯЯ линия
+            final Color color1 = Colors.red.shade400; 
+            // Сдвиг вниз (положительное значение)
+            _drawForecast(canvas, size, deltaPrice, color1, pSameTrend, lastX, lastY, stepX, actualMin, actualMax, actualRange, getY, 25.0); 
             
-            double currentPrice = history.last;
-            double currentX = lastX;
-            
-            for (int i = 1; i <= numPredictionPoints; i++) {
-                currentPrice += initialDelta; 
-                currentX += stepX; // Продолжаем использовать тот же stepX
-                
-                // Прогнозные точки тоже должны быть в разумном Y-диапазоне 
-                final dynamicRange = range == 0 ? 0.01 : range;
-                double predictedPrice = currentPrice.clamp(minPrice - dynamicRange * 0.1, maxPrice + dynamicRange * 0.1);
-
-                forecastPath.lineTo(currentX, getY(predictedPrice));
-            }
-
-            _drawDashedPath(canvas, forecastPath, forecastPaint, 6.0, 4.0);
+            // Сценарий 2: Реверс тренда (UP) - ВЕРХНЯЯ линия
+            final Color color2 = Colors.greenAccent.withOpacity(0.5); 
+            // Сдвиг вверх (отрицательное значение)
+            _drawForecast(canvas, size, -deltaPrice, color2, pReverseTrend, lastX, lastY, stepX, actualMin, actualMax, actualRange, getY, -25.0); 
         }
-        
-        // --- 4. Рисование прогнозных линий (пунктир) ---
-        
-        // 4a. Положительный прогноз (продолжение текущего тренда)
-        drawForecast(deltaPrice, Colors.amber.shade300);
-
-        // 4b. Негативный/Медвежий прогноз (реверс последнего изменения)
-        drawForecast(-deltaPrice, Colors.red.shade400.withOpacity(0.5)); 
     }
 
     @override
     bool shouldRepaint(covariant LineChartPainter oldDelegate) {
-        return oldDelegate.history != history;
+        return oldDelegate.history != history || oldDelegate.currentPrice != currentPrice;
     }
 }
