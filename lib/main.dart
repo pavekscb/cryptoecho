@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:ui' as ui; 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart'; // ✅ ДОБАВЛЕНО для Clipboard
+import 'package:flutter/services.dart'; 
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -64,11 +64,22 @@ class _PortfolioPageState extends State<PortfolioPage> {
   String? _selectedCoinForChart; 
 
   final ValueNotifier<int> _chartUpdateNotifier = ValueNotifier(0); 
+  
+  // ✅ Переменные для логики прогноза
+  int _totalForecasts = 0;
+  int _confirmedForecasts = 0;
+  // 1.0 (рост), -1.0 (падение), null (нет четкого прогноза)
+  double? _lastPredictionDirection; 
+  // ✅ КЛЮЧЕВАЯ ПЕРЕМЕННАЯ: Цена, по которой был сделан _lastPredictionDirection
+  double? _priceAtLastPrediction; 
 
   // Уведомления
   bool _notificationsEnabled = true;
   double _notificationThreshold = 0.01; 
   int _notificationDuration = 10; 
+  
+  // ✅ КОНСТАНТА: Минимальный порог для сравнения с плавающей точкой
+  static const double _epsilon = 1e-8;
   
   @override
   void initState() {
@@ -100,6 +111,10 @@ class _PortfolioPageState extends State<PortfolioPage> {
       _notificationsEnabled = prefs.getBool('notificationsEnabled') ?? true;
       _notificationThreshold = prefs.getDouble('notificationThreshold') ?? 0.01;
       _notificationDuration = prefs.getInt('notificationDuration') ?? 10; 
+      
+      // ✅ Загружаем сохраненный прогноз (для работы после перезапуска)
+      _lastPredictionDirection = prefs.getDouble('lastPredictionDirection');
+      _priceAtLastPrediction = prefs.getDouble('priceAtLastPrediction');
     });
   }
 
@@ -114,6 +129,18 @@ class _PortfolioPageState extends State<PortfolioPage> {
     await prefs.setBool('notificationsEnabled', _notificationsEnabled);
     await prefs.setDouble('notificationThreshold', _notificationThreshold);
     await prefs.setInt('notificationDuration', _notificationDuration);
+    
+    // ✅ Сохраняем прогноз
+    if (_lastPredictionDirection != null) {
+        await prefs.setDouble('lastPredictionDirection', _lastPredictionDirection!);
+    } else {
+        await prefs.remove('lastPredictionDirection');
+    }
+    if (_priceAtLastPrediction != null) {
+        await prefs.setDouble('priceAtLastPrediction', _priceAtLastPrediction!);
+    } else {
+        await prefs.remove('priceAtLastPrediction');
+    }
   }
 
   void _startTimer() {
@@ -129,9 +156,52 @@ class _PortfolioPageState extends State<PortfolioPage> {
     });
   }
   
+  // ✅ Функция проверки подтверждения прогноза (ИСПОЛЬЗУЕМ _epsilon)
+  void _checkForecastConfirmation(String coin, double? oldLastPredictionDirection, double? priceAtPrediction, double newPrice) {
+      // 1. Проверяем, что диалог открыт, монета не сменилась, и есть старый прогноз и цена
+      if (!_isDialogShowing || coin != _selectedCoinForChart || oldLastPredictionDirection == null || priceAtPrediction == null) {
+          return;
+      }
+
+      // 2. Увеличиваем общее число прогнозов
+      _totalForecasts++;
+      
+      // 3. Фактическое изменение
+      final actualChange = newPrice - priceAtPrediction; // newPrice - oldPriceAtPrediction
+      final predictedDirection = oldLastPredictionDirection;
+      
+      bool confirmed = false;
+      
+      // Прогноз на рост (1.0) подтверждается, только если цена СТРОГО выросла (> _epsilon)
+      if (predictedDirection == 1.0) {
+          if (actualChange > _epsilon) { 
+              confirmed = true;
+          }
+      } 
+      // Прогноз на падение (-1.0) подтверждается, только если цена СТРОГО упала (< -_epsilon)
+      else if (predictedDirection == -1.0) {
+          if (actualChange < -_epsilon) { 
+              confirmed = true;
+          }
+      }
+      
+      // Если -_epsilon <= actualChange <= _epsilon, confirmed остается false. Это "без изменений".
+      
+      if (confirmed) {
+          _confirmedForecasts++;
+      }
+  }
+
   Future<void> _fetchPrices() async {
     if (_isUpdating) return;
     _isUpdating = true;
+
+    // ✅ 1. Сохраняем старое состояние ПЕРЕД обновлением для проверки
+    final double? oldLastPredictionDirection = _lastPredictionDirection;
+    final double? oldPriceAtPrediction = _priceAtLastPrediction;
+    
+    // Переменная для хранения новой цены выбранной монеты
+    double newPriceForSelectedCoin = 0.0;
 
     try {
       for (var coin in _coins) {
@@ -161,13 +231,66 @@ class _PortfolioPageState extends State<PortfolioPage> {
               _priceHistory[coin]!.removeLast(); 
             }
           });
+          
+          // Если это выбранная монета, сохраняем ее новую цену
+          if (coin == _selectedCoinForChart) {
+              newPriceForSelectedCoin = newPrice;
+          }
         }
       }
       _calculatePortfolio();
       _saveData(); 
       
-      if (mounted) {
-          _chartUpdateNotifier.value++; 
+      if (mounted && _isDialogShowing && _selectedCoinForChart != null) {
+          final selectedCoin = _selectedCoinForChart!;
+          
+          // ✅ 2. Проверяем СТАРЫЙ прогноз (T-1 -> T)
+          if (oldLastPredictionDirection != null && oldPriceAtPrediction != null) {
+              _checkForecastConfirmation(
+                  selectedCoin, 
+                  oldLastPredictionDirection, 
+                  oldPriceAtPrediction, 
+                  newPriceForSelectedCoin // Используем только что полученную цену
+              );
+          }
+          
+          // ✅ 3. Делаем НОВЫЙ прогноз (T -> T+1)
+          final currentHistory = _priceHistory[selectedCoin] ?? []; // Newest to Oldest (currentPrice, price_t-1, ...)
+          final probabilities = LineChartPainter.calculateForecastProbabilitiesStatic(currentHistory);
+          
+          setState(() {
+              if (currentHistory.length >= 2) {
+                  final double currentPrice = currentHistory[0];
+                  final double priceBefore = currentHistory[1];
+                  final deltaPrice = currentPrice - priceBefore; // Текущее движение
+                  
+                  // Прогнозируем продолжение тренда (Same >= 50%)
+                  if (probabilities['same']! >= 50) { 
+                      // Продолжаем: если deltaPrice > 0, то 1.0 (рост); если < 0, то -1.0 (падение)
+                      _lastPredictionDirection = deltaPrice > _epsilon ? 1.0 : (deltaPrice < -_epsilon ? -1.0 : null);
+                  } 
+                  // Прогнозируем реверс (Reverse > 50%)
+                  else if (probabilities['reverse']! > 50) {
+                      // Реверс: если deltaPrice > 0, то -1.0 (падение); если < 0, то 1.0 (рост)
+                      _lastPredictionDirection = deltaPrice > _epsilon ? -1.0 : (deltaPrice < -_epsilon ? 1.0 : null);
+                  } else {
+                      _lastPredictionDirection = null; // Нет четкого прогноза
+                  }
+              } else {
+                  _lastPredictionDirection = null; // Недостаточно данных
+              }
+              
+              // ✅ 4. Сохраняем цену, по которой был сделан НОВЫЙ прогноз
+              _priceAtLastPrediction = newPriceForSelectedCoin;
+          });
+
+          _chartUpdateNotifier.value++; // ✅ УВЕДОМЛЯЕМ ValueListenableBuilder об обновлении
+      } else {
+          // Если диалог закрыт, сбрасываем прогноз (чтобы не сохранять его)
+          setState(() {
+              _lastPredictionDirection = null;
+              _priceAtLastPrediction = null;
+          });
       }
       
     } catch (e) {
@@ -197,7 +320,7 @@ class _PortfolioPageState extends State<PortfolioPage> {
   }
 
   void _showPriceAlertDialog(Map<String, double> alerts) {
-    if (_isDialogShowing || alerts.isEmpty) { // ✅ ИСПРАВЛЕНИЕ 1: Не вызывать, если пусто
+    if (_isDialogShowing || alerts.isEmpty) { 
         return;
     }
     
@@ -234,7 +357,6 @@ class _PortfolioPageState extends State<PortfolioPage> {
                   style: TextStyle(color: Colors.amber, fontWeight: FontWeight.bold)),
               
               content: SizedBox(
-                  // ✅ ИСПРАВЛЕНИЕ 2: Явно задаем высоту, чтобы избежать проблем рендеринга
                   height: alerts.length * 70.0, 
                   width: double.maxFinite,
                   child: ListView(
@@ -432,82 +554,146 @@ class _PortfolioPageState extends State<PortfolioPage> {
       if (_selectedCoinForChart == null || !_coins.contains(_selectedCoinForChart)) {
           _selectedCoinForChart = _coins.first;
       }
+      
+      // ✅ Инициализируем состояние: сброс счетчиков и установка начального прогноза
+      setState(() {
+          _totalForecasts = 0;
+          _confirmedForecasts = 0;
+          
+          final selectedCoin = _selectedCoinForChart!;
+          final currentHistory = _priceHistory[selectedCoin] ?? [];
+          
+          if (currentHistory.length >= 2) {
+              final probabilities = LineChartPainter.calculateForecastProbabilitiesStatic(currentHistory);
+              final double currentPrice = currentHistory[0];
+              final double priceBefore = currentHistory[1];
+              final deltaPrice = currentPrice - priceBefore;
+              
+              // Расчет начального направления (тот же, что и в _fetchPrices)
+              if (probabilities['same']! >= 50) { 
+                  _lastPredictionDirection = deltaPrice > _epsilon ? 1.0 : (deltaPrice < -_epsilon ? -1.0 : null);
+              } else if (probabilities['reverse']! > 50) {
+                  _lastPredictionDirection = deltaPrice > _epsilon ? -1.0 : (deltaPrice < -_epsilon ? 1.0 : null);
+              } else {
+                  _lastPredictionDirection = null; 
+              }
+              
+              // ✅ Устанавливаем цену на момент прогноза
+              _priceAtLastPrediction = currentHistory[0]; 
+          } else {
+              _lastPredictionDirection = null;
+              _priceAtLastPrediction = null; 
+          }
+      });
+
 
       _isDialogShowing = true;
       showDialog(
           context: context,
           builder: (context) {
-              return StatefulBuilder(
-                  builder: (context, setStateSB) {
-                      final selectedCoin = _selectedCoinForChart!;
-                      // История от старой цены к новой (reversed)
-                      final historyData = (_priceHistory[selectedCoin] ?? []).reversed.toList(); 
-                      
-                      return AlertDialog(
-                          backgroundColor: const Color(0xFF1E1E1E),
-                          title: Text('Аналитика цены (Live) - $selectedCoin', style: const TextStyle(color: Colors.white)), // Добавлено имя монеты
-                          content: SizedBox(
-                              width: 300,
-                              height: 350, // Немного увеличена высота для лучшего отображения подписей
-                              child: Column(
-                                  children: [
-                                      DropdownButtonFormField<String>(
-                                          value: selectedCoin,
-                                          dropdownColor: const Color(0xFF1E1E1E),
-                                          style: const TextStyle(color: Colors.white),
-                                          decoration: const InputDecoration(
-                                              labelText: 'Выберите монету',
-                                              labelStyle: TextStyle(color: Colors.amber),
-                                              border: OutlineInputBorder(),
-                                          ),
-                                          items: _coins.map((String coin) {
-                                              return DropdownMenuItem<String>(
-                                                  value: coin,
-                                                  child: Text(coin),
+              
+              final selectedCoin = _selectedCoinForChart!;
+              // История от старой цены к новой (reversed)
+              final historyData = (_priceHistory[selectedCoin] ?? []).reversed.toList(); 
+              
+              return AlertDialog(
+                  backgroundColor: const Color(0xFF1E1E1E),
+                  title: Text('Аналитика цены (Live) - $selectedCoin', style: const TextStyle(color: Colors.white)), 
+                  content: SizedBox(
+                      width: 300,
+                      height: 350, 
+                      child: Column(
+                          children: [
+                              DropdownButtonFormField<String>(
+                                  value: selectedCoin,
+                                  dropdownColor: const Color(0xFF1E1E1E),
+                                  style: const TextStyle(color: Colors.white),
+                                  decoration: const InputDecoration(
+                                      labelText: 'Выберите монету',
+                                      labelStyle: TextStyle(color: Colors.amber),
+                                      border: OutlineInputBorder(),
+                                  ),
+                                  items: _coins.map((String coin) {
+                                      return DropdownMenuItem<String>(
+                                          value: coin,
+                                          child: Text(coin),
+                                      );
+                                  }).toList(),
+                                  onChanged: (String? newValue) {
+                                      if (newValue != null) {
+                                          // СБРОС при смене монеты (вызываем setState внешнего виджета)
+                                          setState(() {
+                                              _selectedCoinForChart = newValue;
+                                              _totalForecasts = 0;
+                                              _confirmedForecasts = 0;
+                                              _lastPredictionDirection = null; // Будет пересчитан при следующем открытии диалога
+                                              _priceAtLastPrediction = null; 
+                                          });
+                                          // Закрываем и открываем диалог для обновления его контекста
+                                          Navigator.pop(context);
+                                          _showAnalyticsDialog();
+                                      }
+                                  },
+                              ),
+                              
+                              const SizedBox(height: 20),
+                              
+                              // ValueListenableBuilder для "живого" обновления графика
+                              Expanded(
+                                  child: historyData.length < 2
+                                      ? const Center(child: Text('Недостаточно данных для графика.', style: TextStyle(color: Colors.white70)))
+                                      : ValueListenableBuilder<int>(
+                                          valueListenable: _chartUpdateNotifier,
+                                          builder: (context, value, child) {
+                                              // Получаем свежую историю для выбранной монеты
+                                              final freshHistoryData = (_priceHistory[_selectedCoinForChart!] ?? []).reversed.toList();
+                                              final currentPrice = _prices[_selectedCoinForChart!] ?? 0.0;
+                                              final probabilities = LineChartPainter.calculateForecastProbabilitiesStatic(freshHistoryData.reversed.toList());
+                                              
+                                              return CoinPriceChart(
+                                                  history: freshHistoryData,
+                                                  currentPrice: currentPrice,
+                                                  forecastProbabilities: probabilities, // Передаем вероятности
                                               );
-                                          }).toList(),
-                                          onChanged: (String? newValue) {
-                                              if (newValue != null) {
-                                                  setStateSB(() {
-                                                      _selectedCoinForChart = newValue;
-                                                  });
-                                              }
                                           },
-                                      ),
-                                      
-                                      const SizedBox(height: 20),
-                                      
-                                      // ValueListenableBuilder для "живого" обновления графика
-                                      Expanded(
-                                          child: historyData.length < 2
-                                              ? const Center(child: Text('Недостаточно данных для графика.', style: TextStyle(color: Colors.white70)))
-                                              : ValueListenableBuilder<int>(
-                                                  valueListenable: _chartUpdateNotifier,
-                                                  builder: (context, value, child) {
-                                                      // Получаем свежую историю для выбранной монеты
-                                                      final freshHistoryData = (_priceHistory[_selectedCoinForChart!] ?? []).reversed.toList();
-                                                      final currentPrice = _prices[_selectedCoinForChart!] ?? 0.0;
-                                                      return CoinPriceChart(
-                                                          history: freshHistoryData,
-                                                          currentPrice: currentPrice, // Передаем текущую цену
-                                                      );
-                                                  },
-                                              )
-                                      ), 
-                                  ],
-                              ),
-                          ),
-                          actions: [
-                              TextButton(
-                                  onPressed: () => Navigator.pop(context),
-                                  child: const Text('Закрыть', style: TextStyle(color: Colors.amber)),
-                              ),
+                                      )
+                              ), 
                           ],
-                      );
-                  },
+                      ),
+                  ),
+                  actions: [
+                      // ✅ ValueListenableBuilder для реактивного обновления счетчиков
+                      ValueListenableBuilder<int>(
+                          valueListenable: _chartUpdateNotifier,
+                          builder: (context, value, child) {
+                              return Row(
+                                  children: [
+                                      Text(
+                                          'Прогноз: ${_confirmedForecasts}/${_totalForecasts}',
+                                          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 15),
+                                      ),
+                                      const Spacer(),
+                                      TextButton(
+                                          onPressed: () => Navigator.pop(context),
+                                          child: const Text('Закрыть', style: TextStyle(color: Colors.amber)),
+                                      ),
+                                  ],
+                              );
+                          }
+                      ),
+                  ],
               );
           }
-      ).then((_) => _isDialogShowing = false);
+      ).then((_) {
+          _isDialogShowing = false;
+          // ✅ СБРОС СТАТИСТИКИ при закрытии диалога
+          setState(() {
+              _totalForecasts = 0;
+              _confirmedForecasts = 0;
+              _lastPredictionDirection = null;
+              _priceAtLastPrediction = null; // Сбрасываем цену
+          });
+      });
   }
 
   void _helpDialog() {
@@ -558,6 +744,7 @@ class _PortfolioPageState extends State<PortfolioPage> {
                     IconButton(
                         icon: const Icon(Icons.copy, color: Colors.amber, size: 20),
                         onPressed: () {
+                            // Требует flutter/services.dart
                             Clipboard.setData(const ClipboardData(text: evmWallet));
                             ScaffoldMessenger.of(context).showSnackBar(
                                 const SnackBar(
@@ -902,7 +1089,6 @@ class _PortfolioPageState extends State<PortfolioPage> {
                       
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        crossAxisAlignment: CrossAxisAlignment.start, // ✅ ИЗМЕНЕНИЕ 1: Для лучшей верстки
                         children: [
                           Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
@@ -911,18 +1097,13 @@ class _PortfolioPageState extends State<PortfolioPage> {
                                 'Стоимость: \$${((_balances[coin] ?? 0) * (_prices[coin] ?? 0)).toStringAsFixed(2)}',
                                 style: const TextStyle(color: Colors.amber, fontSize: 16, fontWeight: FontWeight.bold),
                               ),
-                              // ✅ ИЗМЕНЕНИЕ 1: Вывод баланса под стоимостью с сокращенной точностью
                               Text( 
-                                '${_balances[coin]?.toStringAsFixed(2) ?? '0.00'} ${_coins.contains(coin) ? coin.replaceAll('USDT', '') : ''}', // 100.01 BTC
+                                // ✅ Форматирование баланса с именем монеты
+                                '${_balances[coin]?.toStringAsFixed(2) ?? '0.00'} ${_coins.contains(coin) ? coin.replaceAll('USDT', '') : ''}', 
                                 style: const TextStyle(color: Colors.amber, fontSize: 14),
                               ),
                             ],
                           ),
-                          // Text(
-                          //   '${_balances[coin]?.toStringAsFixed(4) ?? '0'}', // УДАЛЕНО: Перенесено в Column
-                          //   style: const TextStyle(color: Colors.amber, fontSize: 16),
-                          // ),
-                          
                         ],
                       ),
                       
@@ -1013,25 +1194,27 @@ class _PortfolioPageState extends State<PortfolioPage> {
 // ----------------------------------------------------------------------
 
 class CoinPriceChart extends StatelessWidget {
-    final List<double> history; 
+    final List<double> history; // Oldest to Newest
     final double currentPrice; 
+    final Map<String, int> forecastProbabilities; 
 
-    const CoinPriceChart({required this.history, required this.currentPrice, super.key});
+    const CoinPriceChart({required this.history, required this.currentPrice, required this.forecastProbabilities, super.key}); 
 
     @override
     Widget build(BuildContext context) {
         return CustomPaint(
-            painter: LineChartPainter(history: history, currentPrice: currentPrice),
+            painter: LineChartPainter(history: history, currentPrice: currentPrice, forecastProbabilities: forecastProbabilities), 
             child: Container(),
         );
     }
 }
 
 class LineChartPainter extends CustomPainter {
-    final List<double> history;
+    final List<double> history; // Oldest to Newest
     final double currentPrice; 
+    final Map<String, int> forecastProbabilities; 
 
-    LineChartPainter({required this.history, required this.currentPrice});
+    LineChartPainter({required this.history, required this.currentPrice, required this.forecastProbabilities}); 
 
     // Хелпер для рисования пунктирных линий
     void _drawDashedPath(Canvas canvas, Path path, Paint paint, double dash, double gap) {
@@ -1048,20 +1231,25 @@ class LineChartPainter extends CustomPainter {
         }
     }
     
-    // ✅ Расчет вероятностей на основе последних 5 интервалов
-    Map<String, int> _calculateForecastProbabilities() {
-        if (history.length < 3) return {'same': 50, 'reverse': 50}; // Дефолт 50/50
-
+    // ✅ СТАТИЧЕСКАЯ ФУНКЦИЯ: Расчет вероятностей на основе последних 5 интервалов
+    // Принимает: List<double> history (Newest to Oldest)
+    static Map<String, int> calculateForecastProbabilitiesStatic(List<double> history) {
+        if (history.length < 3) return {'same': 50, 'reverse': 50}; 
+        
+        // История: [newPrice, price_t-1, price_t-2, ...]
+        
         // Определяем направление последнего движения (которое мы продолжаем/реверсируем)
-        final bool lastMoveUp = history.last > history[history.length - 2];
+        // lastMoveUp = (currentPrice > price_t-1)
+        final bool lastMoveUp = history[0] > history[1];
 
-        // Анализируем последние 5 интервалов
+        // Анализируем последние 5 интервалов (price_t-1 -> price_t-2, price_t-2 -> price_t-3, ...)
         int sameDirectionCount = 0;
         int oppositeDirectionCount = 0;
         
-        // Начинаем с предпоследней точки (интервал history[i-1] -> history[i])
-        for (int i = history.length - 2; i >= 1 && i >= history.length - 6; i--) {
-            final bool currentMoveUp = history[i] > history[i - 1];
+        // Начинаем с интервала между [1] и [2]
+        for (int i = 1; i < history.length - 1 && i < 6; i++) {
+            // currentMoveUp = (price_t-i > price_t-(i+1))
+            final bool currentMoveUp = history[i] > history[i + 1]; 
             if (currentMoveUp == lastMoveUp) {
                 sameDirectionCount++;
             } else {
@@ -1085,9 +1273,9 @@ class LineChartPainter extends CustomPainter {
     // Хелпер для форматирования цены (✅ УСЛОВНАЯ ТОЧНОСТЬ)
     String _formatPrice(double price) {
         if (price >= 1000) {
-            return price.toStringAsFixed(2); // Высокая цена: меньше точность (105306.12)
+            return price.toStringAsFixed(2); 
         } else if (price >= 1) {
-            return price.toStringAsFixed(4); // Средняя цена: 4 знака (3.2312)
+            return price.toStringAsFixed(4); 
         } else if (price >= 0.001) {
             return price.toStringAsFixed(4);
         } else {
@@ -1108,7 +1296,7 @@ class LineChartPainter extends CustomPainter {
         final forecastPath = Path();
         forecastPath.moveTo(lastX, lastY); // Начинаем с последней точки истории
         
-        double currentPrice = history.last;
+        double priceAtPrediction = history.last;
         double currentX = lastX;
         
         final double actualMinForClamp = actualMin;
@@ -1118,11 +1306,11 @@ class LineChartPainter extends CustomPainter {
         double price1 = 0.0, price2 = 0.0;
         
         for (int i = 1; i <= numPredictionPoints; i++) {
-            currentPrice += initialDelta; 
+            priceAtPrediction += initialDelta; 
             currentX += stepX; 
             
             // Клампим цену для отрисовки, чтобы она оставалась в разумном диапазоне
-            double predictedPrice = currentPrice.clamp(actualMinForClamp, actualMaxForClamp);
+            double predictedPrice = priceAtPrediction.clamp(actualMinForClamp, actualMaxForClamp);
 
             forecastPath.lineTo(currentX, getY(predictedPrice));
             
@@ -1136,6 +1324,7 @@ class LineChartPainter extends CustomPainter {
         
         // Находим приблизительную среднюю точку на прогнозной линии
         final double midX = lastX + 1.5 * stepX; 
+        // Используем среднее значение Y первой и второй прогнозируемых точек
         final double midY = (getY(price1) + getY(price2)) / 2.0; 
         
         final textPainter = TextPainter(
@@ -1198,7 +1387,7 @@ class LineChartPainter extends CustomPainter {
             return chartHeight * (1.0 - normalized); 
         }
         
-        // --- 2. Рисование сетки и меток (Оси Y) (✅ УМЕНЬШЕН ШРИФТ) ---
+        // --- 2. Рисование сетки и меток (Оси Y) ---
         final gridPaint = Paint()
             ..color = Colors.grey.withOpacity(0.15)
             ..strokeWidth = 0.5
@@ -1222,7 +1411,7 @@ class LineChartPainter extends CustomPainter {
                     text: _formatPrice(price),
                     style: TextStyle(
                         color: Colors.white70,
-                        fontSize: 10.0, // ИЗМЕНЕНИЕ: Уменьшен до 10.0 для умещения крупных цен
+                        fontSize: 10.0, // Уменьшен до 10.0 для умещения крупных цен
                         fontWeight: FontWeight.w300,
                     ),
                 ),
@@ -1238,6 +1427,7 @@ class LineChartPainter extends CustomPainter {
         }
 
         // --- 3. Рисование исторической линии (сплошная) ---
+        // history.last - самая новая цена, history.first - самая старая
         final historyPaint = Paint()
             ..color = history.last > history.first ? Colors.greenAccent : Colors.red.shade300!
             ..strokeWidth = 2.0
@@ -1259,7 +1449,7 @@ class LineChartPainter extends CustomPainter {
         // Рисуем точку на текущей цене
         canvas.drawCircle(Offset(lastX, lastY), 4.0, Paint()..color = historyPaint.color..style = PaintingStyle.fill);
         
-        // --- 4. Метка текущей цены (✅ СДВИНУТА ВЛЕВО) ---
+        // --- 4. Метка текущей цены ---
         final currentPricePainter = TextPainter(
             text: TextSpan(
                 text: _formatPrice(currentPrice),
@@ -1282,38 +1472,41 @@ class LineChartPainter extends CustomPainter {
 
         // --- 5. Рисование прогнозных линий (пунктир) ---
         
-        final Map<String, int> probabilities = _calculateForecastProbabilities();
-        final int pSameTrend = probabilities['same']!;
-        final int pReverseTrend = probabilities['reverse']!;
+        final int pSameTrend = forecastProbabilities['same']!;
+        final int pReverseTrend = forecastProbabilities['reverse']!;
 
         // Разница в цене между последней и предпоследней точкой (текущий тренд)
-        final double deltaPrice = history.last - history[history.length - 2]; 
+        final double deltaPrice = history.length > 1 ? history.last - history[history.length - 2] : 0.0; 
+        
+        // Фактические сдвиги
+        const double offsetAbove = -25.0; // Сдвиг вверх для верхней линии
+        const double offsetBelow = 25.0;  // Сдвиг вниз для нижней линии
 
-        if (deltaPrice >= 0) {
-            // Сценарий 1: Продолжение тренда (UP) - ВЕРХНЯЯ линия
-            final Color color1 = Colors.greenAccent; 
-            // Сдвиг вверх (отрицательное значение)
-            _drawForecast(canvas, size, deltaPrice, color1, pSameTrend, lastX, lastY, stepX, actualMin, actualMax, actualRange, getY, -25.0); 
 
-            // Сценарий 2: Реверс тренда (DOWN) - НИЖНЯЯ линия
-            final Color color2 = Colors.red.shade400.withOpacity(0.5); 
-            // Сдвиг вниз (положительное значение)
-            _drawForecast(canvas, size, -deltaPrice, color2, pReverseTrend, lastX, lastY, stepX, actualMin, actualMax, actualRange, getY, 25.0); 
-        } else {
-            // Сценарий 1: Продолжение тренда (DOWN) - НИЖНЯЯ линия
-            final Color color1 = Colors.red.shade400; 
-            // Сдвиг вниз (положительное значение)
-            _drawForecast(canvas, size, deltaPrice, color1, pSameTrend, lastX, lastY, stepX, actualMin, actualMax, actualRange, getY, 25.0); 
-            
-            // Сценарий 2: Реверс тренда (UP) - ВЕРХНЯЯ линия
-            final Color color2 = Colors.greenAccent.withOpacity(0.5); 
-            // Сдвиг вверх (отрицательное значение)
-            _drawForecast(canvas, size, -deltaPrice, color2, pReverseTrend, lastX, lastY, stepX, actualMin, actualMax, actualRange, getY, -25.0); 
+        // Проверяем, есть ли вообще какой-то тренд, чтобы рисовать прогноз
+        if (deltaPrice.abs() > 1e-8) { // Используем epsilon
+            if (deltaPrice > 0) {
+                // Сценарий 1: Продолжение тренда (UP) - ВЕРХНЯЯ линия
+                final Color color1 = Colors.greenAccent; 
+                _drawForecast(canvas, size, deltaPrice, color1, pSameTrend, lastX, lastY, stepX, actualMin, actualMax, actualRange, getY, offsetAbove); 
+
+                // Сценарий 2: Реверс тренда (DOWN) - НИЖНЯЯ линия
+                final Color color2 = Colors.red.shade400.withOpacity(0.5); 
+                _drawForecast(canvas, size, -deltaPrice, color2, pReverseTrend, lastX, lastY, stepX, actualMin, actualMax, actualRange, getY, offsetBelow); 
+            } else {
+                // Сценарий 1: Продолжение тренда (DOWN) - НИЖНЯЯ линия
+                final Color color1 = Colors.red.shade400; 
+                _drawForecast(canvas, size, deltaPrice, color1, pSameTrend, lastX, lastY, stepX, actualMin, actualMax, actualRange, getY, offsetBelow); 
+                
+                // Сценарий 2: Реверс тренда (UP) - ВЕРХНЯЯ линия
+                final Color color2 = Colors.greenAccent.withOpacity(0.5); 
+                _drawForecast(canvas, size, -deltaPrice, color2, pReverseTrend, lastX, lastY, stepX, actualMin, actualMax, actualRange, getY, offsetAbove); 
+            }
         }
     }
 
     @override
     bool shouldRepaint(covariant LineChartPainter oldDelegate) {
-        return oldDelegate.history != history || oldDelegate.currentPrice != currentPrice;
+        return oldDelegate.history != history || oldDelegate.currentPrice != currentPrice || oldDelegate.forecastProbabilities != forecastProbabilities;
     }
 }
