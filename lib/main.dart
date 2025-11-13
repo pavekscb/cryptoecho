@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'windows.dart';
 
 void main() {
   runApp(const MyApp());
@@ -925,6 +926,19 @@ class _PortfolioPageState extends State<PortfolioPage> {
     }
   }
 
+  // ✅ НОВАЯ ФУНКЦИЯ ДЛЯ ОТКРЫТИЯ ДИАЛОГА
+  void _showInfoToolsDialog() {
+      // Это стандартная логика, чтобы избежать наложения диалогов
+      _isDialogShowing = true; 
+      showDialog(
+          context: context,
+          builder: (context) {
+              return const InfoToolsDialog(); // Виджет из windows.dart
+          }
+      ).then((_) => _isDialogShowing = false);
+  }
+
+
   String _formatChange(double? change) {
     if (change == null) return '0.00%';
     final sign = change > 0 ? '+' : '';
@@ -1041,10 +1055,12 @@ class _PortfolioPageState extends State<PortfolioPage> {
         title: const Text('CryptoEcho'), 
         actions: [
           IconButton(onPressed: _addCoinDialog, icon: const Icon(Icons.add)),
+          // ✅ ИЗМЕНЕНИЕ ЗДЕСЬ: используем новую функцию _showInfoToolsDialog()
+          IconButton(onPressed: _showInfoToolsDialog, icon: const Icon(Icons.info_outline)), 
           IconButton(onPressed: _showAnalyticsDialog, icon: const Icon(Icons.bar_chart)), 
           IconButton(onPressed: _helpDialog, icon: const Icon(Icons.help_outline)), 
           IconButton(onPressed: _settingsDialog, icon: const Icon(Icons.settings)),
-        ],
+        ], 
       ),
       body: RefreshIndicator(
         onRefresh: _refresh,
